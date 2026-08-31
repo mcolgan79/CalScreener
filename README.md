@@ -64,6 +64,29 @@ python3 calscreener.py --front-dte 45 --back-dte 90 --dte-tolerance 15 --ff-thre
 
 Run `python3 calscreener.py --help` for the full flag list.
 
+## Running it from your phone (web UI)
+
+`streamlit_app.py` wraps the screener in a mobile-friendly web page. Easiest
+free way to get a real URL you can bookmark on your phone:
+
+1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with
+   your GitHub account.
+2. Click **New app**, pick this repo (`mcolgan79/CalScreener`), the
+   `claude/sp500-options-backwardation-jsiecc` branch (or `main` once merged),
+   and set the main file path to `streamlit_app.py`.
+3. Click **Deploy**. Streamlit installs `requirements.txt` and gives you a
+   URL like `https://your-app-name.streamlit.app`.
+4. Open that URL on your phone and add it to your home screen — it behaves
+   like a lightweight app: adjust settings in the sidebar, tap **Run screen**,
+   see a sortable results table, and download the CSV.
+
+Notes:
+- The free tier sleeps after inactivity, so the first load after a while can
+  take ~30 seconds to spin back up.
+- A full 50-name scan still has to make dozens of network calls to Yahoo
+  Finance per run, so expect it to take a couple of minutes on mobile data.
+- To test locally first: `pip install -r requirements.txt && streamlit run streamlit_app.py`.
+
 ## Notes / limitations
 
 - Yahoo's `impliedVolatility` field is Yahoo's own model output, not exchange
