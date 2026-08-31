@@ -22,22 +22,33 @@ the output rather than silently trusted.
    - **Long Double Calendar (35Δ)** — call leg at +0.35 delta, put leg at
      -0.35 delta (delta computed via Black-Scholes from Yahoo's implied vol,
      since Yahoo doesn't publish greeks directly).
-4. **Forward factor** — ratio of annualized variance between the two legs:
+4. **Forward IV / forward factor** — variance is additive over time, so the
+   implied vol of the forward period *between* the two expirations solves:
 
    ```
-   forward_factor = (IV_front / IV_back)^2 - 1
+   Forward_IV = sqrt( (IV_back^2 * T_back - IV_front^2 * T_front) / (T_back - T_front) )
+   forward_factor = (IV_front - Forward_IV) / Forward_IV
    ```
 
-   A positive value means front-month variance is richer than back-month
-   variance (backwardation) — the condition a long calendar wants. This is a
-   screening heuristic, not a formal no-arbitrage forward-vol calculation.
+   (`T` = DTE / 365.) A positive forward factor means the front month is
+   priced hotter than the market's own implied vol for the stretch between
+   the two expirations — backwardation, and the condition a long calendar
+   wants. This is a screening heuristic, not a trade signal on its own.
+
+   **Negative forward variance**: if front-month IV is rich enough relative
+   to the back month, the expression under the square root goes negative —
+   no real forward vol satisfies the equation. That's the most extreme form
+   of backwardation there is, but `forward_factor` is mathematically
+   undefined for it. Those rows are still shown, flagged
+   `negative_forward_variance=True`, but are **excluded from the ranking**
+   (they sort after every row with a real forward factor) — review them by
+   hand rather than trust an invented number.
 
    Any contract with no live bid/ask, or an implied vol outside a 2%-300%
    sanity band, is treated as an unreliable Yahoo quote and excluded from
    strike selection (falling back to the next nearest tradeable strike, or
    dropping the row entirely if nothing qualifies). Without this guard, an
-   illiquid strike's near-zero IV can appear as the denominator and blow the
-   ratio up into a meaningless number.
+   illiquid strike's junk IV can distort the forward-vol calculation.
 
 ## Ranking
 
