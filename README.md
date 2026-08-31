@@ -32,6 +32,13 @@ the output rather than silently trusted.
    variance (backwardation) — the condition a long calendar wants. This is a
    screening heuristic, not a formal no-arbitrage forward-vol calculation.
 
+   Any contract with no live bid/ask, or an implied vol outside a 2%-300%
+   sanity band, is treated as an unreliable Yahoo quote and excluded from
+   strike selection (falling back to the next nearest tradeable strike, or
+   dropping the row entirely if nothing qualifies). Without this guard, an
+   illiquid strike's near-zero IV can appear as the denominator and blow the
+   ratio up into a meaningless number.
+
 ## Ranking
 
 Results are sorted in this priority order (each one a tiebreaker for the one

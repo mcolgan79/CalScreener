@@ -59,6 +59,8 @@ FF_THRESHOLD = 0.20         # forward factor priority cutoff (20%)
 RISK_FREE_RATE = 0.05
 TARGET_DELTA = 0.35
 STALE_DAYS = 5              # contract quotes older than this are flagged
+MIN_VALID_IV = 0.02         # below this, treat Yahoo's IV as a data artifact
+MAX_VALID_IV = 3.00         # above this, same -- reject rather than trust it
 LIQUIDITY_LOOKBACK_DAYS = "1mo"
 
 FALLBACK_TICKERS = [
@@ -154,6 +156,29 @@ def is_stale(last_trade_date, as_of: dt.datetime, max_age_days: int) -> bool:
     return (as_of - ltd).days > max_age_days
 
 
+def has_tradeable_quote(row) -> bool:
+    """Reject contracts with no real two-sided market or an out-of-range IV.
+
+    Yahoo's implied-vol model regularly spits out near-zero (or absurdly
+    high) IV for thinly-traded/wide-spread contracts. Feeding one of those
+    into a variance ratio blows up the forward factor into meaningless
+    territory (billions of percent), so anything outside a sane IV band, or
+    with no live bid/ask, is treated as unreliable and dropped rather than
+    trusted.
+    """
+    iv = row.get("impliedVolatility")
+    if iv is None or pd.isna(iv) or not (MIN_VALID_IV <= iv <= MAX_VALID_IV):
+        return False
+    bid, ask = row.get("bid", 0) or 0, row.get("ask", 0) or 0
+    return bid > 0 and ask > 0
+
+
+def filter_tradeable(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df[df.apply(has_tradeable_quote, axis=1)].copy()
+
+
 # --------------------------------------------------------------------------
 # Per-ticker data structures
 # --------------------------------------------------------------------------
@@ -193,6 +218,7 @@ def pick_expiry(expirations: list[str], today: dt.date, target_dte: int,
 
 def atm_leg(calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
             as_of: dt.datetime) -> Optional[LegQuote]:
+    calls, puts = filter_tradeable(calls), filter_tradeable(puts)
     if calls.empty or puts.empty:
         return None
     c_idx = (calls["strike"] - spot).abs().idxmin()
@@ -212,10 +238,7 @@ def atm_leg(calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
 def delta_leg(chain: pd.DataFrame, spot: float, T: float, r: float,
               option_type: str, target_delta: float,
               as_of: dt.datetime) -> Optional[LegQuote]:
-    if chain.empty:
-        return None
-    df = chain.copy()
-    df = df[df["impliedVolatility"] > 0]
+    df = filter_tradeable(chain)
     if df.empty:
         return None
     signed_target = target_delta if option_type == "call" else -target_delta
