@@ -17,18 +17,44 @@ IV index (per leg):
     calendar       -> implied vol at the strike whose Black-Scholes delta is
                        closest to +0.35 (calls) / -0.35 (puts).
 
-Forward factor:
-    Ratio of annualized variance between the front and back leg:
+Forward IV / forward factor:
+    Variance is additive over time, so the implied volatility of the
+    "forward" period sitting between the front and back expirations solves:
 
-        forward_factor = (IV_front^2 / IV_back^2) - 1
+        IV_back^2 * T_back = IV_front^2 * T_front + Forward_IV^2 * (T_back - T_front)
 
-    IV is already an annualized number, so no additional time-scaling is
-    needed to compare the two variances. A positive forward factor means
-    front-month variance is richer than back-month variance, i.e. the term
-    structure is in backwardation -- exactly the condition that makes a long
-    calendar (short front / long back) attractive. forward_factor > 0.20
-    means front variance is running at least 20% hot relative to the back
-    month.
+        Forward_IV = sqrt(
+            (IV_back^2 * T_back - IV_front^2 * T_front) / (T_back - T_front)
+        )
+
+    T is time to expiration in years (DTE / 365). Forward factor then
+    compares the front leg to that forward vol rather than to the back leg
+    directly:
+
+        forward_factor = (IV_front - Forward_IV) / Forward_IV
+
+    A positive forward factor means the front month is priced hotter than
+    the market's own implied vol for the forward stretch between the two
+    expirations -- backwardation, and the condition a long calendar wants.
+
+    Forward_IV is treated as undefined (forward_factor -> NaN) in two cases,
+    both flagged in the output rather than silently producing a number:
+
+    - `negative_forward_variance`: the equation solves to a *negative* number
+      under the square root (front IV rich enough relative to back IV that no
+      real forward vol satisfies variance additivity). The most extreme form
+      of backwardation there is.
+    - `forward_iv_below_floor`: the equation has a real, positive solution,
+      but it's below MIN_VALID_IV. A Forward_IV that close to zero is
+      dividing forward_factor by almost nothing, so ordinary noise in
+      Yahoo's IV quotes (a point or two either way) swings the ratio by
+      hundreds or thousands of percent -- not a real signal, just the
+      formula amplifying quote noise near its own singularity.
+
+    Rows hitting either case are still included in the output but are NOT
+    ranked by forward factor -- pandas' NaN sort puts them after every row
+    with a real, computed forward factor, so you can review them by hand
+    rather than trust an unstable number.
 
 This is a screening heuristic, not a formal no-arbitrage forward-vol
 calculation -- treat the ranking as a starting point for further diligence,
@@ -59,6 +85,8 @@ FF_THRESHOLD = 0.20         # forward factor priority cutoff (20%)
 RISK_FREE_RATE = 0.05
 TARGET_DELTA = 0.35
 STALE_DAYS = 5              # contract quotes older than this are flagged
+MIN_VALID_IV = 0.02         # below this, treat Yahoo's IV as a data artifact
+MAX_VALID_IV = 3.00         # above this, same -- reject rather than trust it
 LIQUIDITY_LOOKBACK_DAYS = "1mo"
 
 FALLBACK_TICKERS = [
@@ -139,10 +167,50 @@ def bs_delta(S: float, K: float, T: float, r: float, sigma: float,
     return norm.cdf(d1) - 1.0
 
 
-def forward_factor(iv_front: float, iv_back: float) -> float:
-    if not iv_front or not iv_back or iv_back == 0:
+def implied_forward_iv(iv_front: float, iv_back: float, T_front: float,
+                        T_back: float) -> tuple[float, float]:
+    """Solve for the implied vol of the front-to-back forward period.
+
+    Returns (forward_iv, forward_variance). forward_iv is NaN when:
+      - forward_variance comes out <= 0 (no real solution -- the term
+        structure is inverted enough that the additivity equation breaks), or
+      - forward_variance is positive but tiny, so its square root falls below
+        MIN_VALID_IV. That's not a data error either, but forward_factor
+        divides by this value, and a real-but-near-zero Forward IV is
+        exquisitely sensitive to ordinary noise in Yahoo's IV quotes (a
+        difference of a percentage point or two on either leg swings the
+        forward vol by a large relative amount over a ~30-day forward
+        window). Trusting it as a denominator is how you get forward
+        factors in the thousands of percent from perfectly ordinary-looking
+        front/back IVs -- so it's floored out the same as an out-of-range
+        raw quote would be.
+    """
+    if not iv_front or not iv_back or T_back <= T_front:
+        return np.nan, np.nan
+    var_front = iv_front ** 2 * T_front
+    var_back = iv_back ** 2 * T_back
+    var_forward = (var_back - var_front) / (T_back - T_front)
+    if var_forward <= 0:
+        return np.nan, var_forward
+    fwd_iv = np.sqrt(var_forward)
+    if fwd_iv < MIN_VALID_IV:
+        return np.nan, var_forward
+    return float(fwd_iv), var_forward
+
+
+def classify_forward_iv(fwd_iv: float, var_fwd: float) -> tuple[bool, bool]:
+    """Return (negative_forward_variance, forward_iv_below_floor) flags."""
+    if np.isnan(var_fwd):
+        return False, False
+    negative = var_fwd <= 0
+    below_floor = (not negative) and np.isnan(fwd_iv)
+    return negative, below_floor
+
+
+def forward_factor(iv_front: float, forward_iv: float) -> float:
+    if not iv_front or not forward_iv or np.isnan(forward_iv) or forward_iv == 0:
         return np.nan
-    return (iv_front ** 2) / (iv_back ** 2) - 1.0
+    return (iv_front - forward_iv) / forward_iv
 
 
 def is_stale(last_trade_date, as_of: dt.datetime, max_age_days: int) -> bool:
@@ -152,6 +220,29 @@ def is_stale(last_trade_date, as_of: dt.datetime, max_age_days: int) -> bool:
     if ltd.tzinfo is not None:
         ltd = ltd.tz_convert(None)
     return (as_of - ltd).days > max_age_days
+
+
+def has_tradeable_quote(row) -> bool:
+    """Reject contracts with no real two-sided market or an out-of-range IV.
+
+    Yahoo's implied-vol model regularly spits out near-zero (or absurdly
+    high) IV for thinly-traded/wide-spread contracts. Feeding one of those
+    into a variance ratio blows up the forward factor into meaningless
+    territory (billions of percent), so anything outside a sane IV band, or
+    with no live bid/ask, is treated as unreliable and dropped rather than
+    trusted.
+    """
+    iv = row.get("impliedVolatility")
+    if iv is None or pd.isna(iv) or not (MIN_VALID_IV <= iv <= MAX_VALID_IV):
+        return False
+    bid, ask = row.get("bid", 0) or 0, row.get("ask", 0) or 0
+    return bid > 0 and ask > 0
+
+
+def filter_tradeable(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df[df.apply(has_tradeable_quote, axis=1)].copy()
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +284,7 @@ def pick_expiry(expirations: list[str], today: dt.date, target_dte: int,
 
 def atm_leg(calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
             as_of: dt.datetime) -> Optional[LegQuote]:
+    calls, puts = filter_tradeable(calls), filter_tradeable(puts)
     if calls.empty or puts.empty:
         return None
     c_idx = (calls["strike"] - spot).abs().idxmin()
@@ -212,10 +304,7 @@ def atm_leg(calls: pd.DataFrame, puts: pd.DataFrame, spot: float,
 def delta_leg(chain: pd.DataFrame, spot: float, T: float, r: float,
               option_type: str, target_delta: float,
               as_of: dt.datetime) -> Optional[LegQuote]:
-    if chain.empty:
-        return None
-    df = chain.copy()
-    df = df[df["impliedVolatility"] > 0]
+    df = filter_tradeable(chain)
     if df.empty:
         return None
     signed_target = target_delta if option_type == "call" else -target_delta
@@ -277,7 +366,9 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
         f_leg = atm_leg(front_chain.calls, front_chain.puts, spot, now)
         b_leg = atm_leg(back_chain.calls, back_chain.puts, spot, now)
         if f_leg and b_leg:
-            ff = forward_factor(f_leg.iv, b_leg.iv)
+            fwd_iv, var_fwd = implied_forward_iv(f_leg.iv, b_leg.iv, T_front, T_back)
+            ff = forward_factor(f_leg.iv, fwd_iv)
+            neg_var, below_floor = classify_forward_iv(fwd_iv, var_fwd)
             rows.append({
                 "ticker": ticker, "strategy": "Long Calendar (ATM)",
                 "spot": round(spot, 2),
@@ -285,7 +376,10 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
                 "back_expiry": back_exp, "back_dte": back_dte,
                 "front_strike": f_leg.strike, "back_strike": b_leg.strike,
                 "front_iv": round(f_leg.iv, 4), "back_iv": round(b_leg.iv, 4),
+                "forward_iv": round(fwd_iv, 4) if not np.isnan(fwd_iv) else np.nan,
                 "forward_factor": round(ff, 4) if not np.isnan(ff) else np.nan,
+                "negative_forward_variance": neg_var,
+                "forward_iv_below_floor": below_floor,
                 "front_oi": int(f_leg.open_interest), "back_oi": int(b_leg.open_interest),
                 "total_oi": int(f_leg.open_interest + b_leg.open_interest),
                 "stale_quote": f_leg.stale or b_leg.stale,
@@ -297,9 +391,21 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
         fp = delta_leg(front_chain.puts, spot, T_front, r, "put", target_delta, now)
         bp = delta_leg(back_chain.puts, spot, T_back, r, "put", target_delta, now)
         if fc and bc and fp and bp:
-            ff_call = forward_factor(fc.iv, bc.iv)
-            ff_put = forward_factor(fp.iv, bp.iv)
-            ff_avg = np.nanmean([ff_call, ff_put])
+            fwd_iv_call, var_fwd_call = implied_forward_iv(fc.iv, bc.iv, T_front, T_back)
+            fwd_iv_put, var_fwd_put = implied_forward_iv(fp.iv, bp.iv, T_front, T_back)
+            neg_call, floor_call = classify_forward_iv(fwd_iv_call, var_fwd_call)
+            neg_put, floor_put = classify_forward_iv(fwd_iv_put, var_fwd_put)
+            negative_var = neg_call or neg_put
+            below_floor = floor_call or floor_put
+            if negative_var or below_floor:
+                # Unreliable on at least one leg -- don't mask it by
+                # averaging in the other leg's (possibly normal) factor.
+                ff_avg, fwd_iv_avg = np.nan, np.nan
+            else:
+                ff_call = forward_factor(fc.iv, fwd_iv_call)
+                ff_put = forward_factor(fp.iv, fwd_iv_put)
+                ff_avg = np.nanmean([ff_call, ff_put])
+                fwd_iv_avg = np.nanmean([fwd_iv_call, fwd_iv_put])
             front_iv_avg = np.mean([fc.iv, fp.iv])
             back_iv_avg = np.mean([bc.iv, bp.iv])
             rows.append({
@@ -310,7 +416,10 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
                 "front_strike": f"{fc.strike}C/{fp.strike}P",
                 "back_strike": f"{bc.strike}C/{bp.strike}P",
                 "front_iv": round(front_iv_avg, 4), "back_iv": round(back_iv_avg, 4),
+                "forward_iv": round(fwd_iv_avg, 4) if not np.isnan(fwd_iv_avg) else np.nan,
                 "forward_factor": round(ff_avg, 4) if not np.isnan(ff_avg) else np.nan,
+                "negative_forward_variance": negative_var,
+                "forward_iv_below_floor": below_floor,
                 "front_oi": int(fc.open_interest + fp.open_interest),
                 "back_oi": int(bc.open_interest + bp.open_interest),
                 "total_oi": int(fc.open_interest + fp.open_interest +
@@ -328,7 +437,12 @@ def rank_results(df: pd.DataFrame, front_target: int, back_target: int,
                   ff_threshold: float) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.dropna(subset=["forward_factor"]).copy()
+    df = df.copy()
+    # forward_factor is NaN when the term structure is so inverted that no
+    # real forward vol solves the variance equation (negative_forward_variance
+    # = True). Those rows are kept but never win the ranking on forward
+    # factor -- sort_values() puts NaN last within each ascending/descending
+    # group, so they surface after every row with a real forward factor.
     df["meets_ff_threshold"] = df["forward_factor"] >= ff_threshold
     df["dte_distance"] = (
         (df["front_dte"] - front_target).abs() + (df["back_dte"] - back_target).abs()
@@ -402,6 +516,7 @@ def main() -> None:
 
     display_cols = [
         "ticker", "strategy", "spot", "forward_factor", "meets_ff_threshold",
+        "negative_forward_variance", "forward_iv_below_floor", "forward_iv",
         "front_expiry", "front_dte", "front_strike", "front_iv", "front_oi",
         "back_expiry", "back_dte", "back_strike", "back_iv", "back_oi",
         "total_oi", "stale_quote",
