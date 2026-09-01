@@ -35,14 +35,27 @@ the output rather than silently trusted.
    the two expirations — backwardation, and the condition a long calendar
    wants. This is a screening heuristic, not a trade signal on its own.
 
-   **Negative forward variance**: if front-month IV is rich enough relative
-   to the back month, the expression under the square root goes negative —
-   no real forward vol satisfies the equation. That's the most extreme form
-   of backwardation there is, but `forward_factor` is mathematically
-   undefined for it. Those rows are still shown, flagged
-   `negative_forward_variance=True`, but are **excluded from the ranking**
-   (they sort after every row with a real forward factor) — review them by
-   hand rather than trust an invented number.
+   **When Forward_IV is unreliable**, `forward_factor` is set to NaN rather
+   than trusted, and the row is flagged instead of ranked normally — it's
+   still shown, but sorts after every row with a real forward factor:
+
+   - `negative_forward_variance=True` — the expression under the square root
+     went negative; no real forward vol satisfies the equation. The most
+     extreme form of backwardation there is.
+   - `forward_iv_below_floor=True` — the equation has a real, positive
+     solution, but it's below the same 2% sanity floor used for raw quotes.
+     Dividing by a near-zero Forward_IV means ordinary noise in Yahoo's IV
+     quotes (a point or two either way) swings `forward_factor` by hundreds
+     or thousands of percent — not a real signal, just the formula
+     amplifying quote noise near its own singularity. This is what produces
+     the implausible thousands-of-percent readings if left unguarded.
+
+   Either way, review the row by hand rather than trust an unstable number.
+   Note this instability is inherent to a *tight* front/back DTE spacing:
+   with 60/90-day legs specifically, a real forward vol only exists at all
+   when back IV is at least ≈82% of front IV (`sqrt(60/90)`); anything more
+   inverted than that lands in one of the two flagged cases above, which is
+   expected, not a bug.
 
    Any contract with no live bid/ask, or an implied vol outside a 2%-300%
    sanity band, is treated as an unreliable Yahoo quote and excluded from

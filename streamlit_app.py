@@ -99,19 +99,22 @@ ranked = st.session_state["results"]
 if ranked is not None:
     display_cols = [
         "ticker", "strategy", "spot", "forward_factor", "meets_ff_threshold",
-        "negative_forward_variance", "forward_iv",
+        "negative_forward_variance", "forward_iv_below_floor", "forward_iv",
         "front_expiry", "front_dte", "front_strike", "front_iv", "front_oi",
         "back_expiry", "back_dte", "back_strike", "back_iv", "back_oi",
         "total_oi", "stale_quote",
     ]
     out = ranked[display_cols].head(max_rows)
     st.success(f"{len(ranked)} candidate(s) found, showing top {len(out)}.")
-    if out["negative_forward_variance"].any():
+    if out["negative_forward_variance"].any() or out["forward_iv_below_floor"].any():
         st.warning(
-            "Rows flagged `negative_forward_variance` imply a forward vol so "
-            "extreme the term-structure equation has no real solution -- the "
-            "most severe form of backwardation. They're shown but excluded "
-            "from the forward-factor ranking; review them manually."
+            "Some rows have an unreliable forward vol and are excluded from "
+            "the forward-factor ranking (shown last, review manually): "
+            "`negative_forward_variance` means the term-structure equation "
+            "has no real solution (the most extreme form of backwardation); "
+            "`forward_iv_below_floor` means it does, but the result is so "
+            "close to zero that ordinary quote noise would swing the ratio "
+            "by hundreds of percent."
         )
     st.dataframe(
         out.style.format({

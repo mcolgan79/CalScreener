@@ -37,15 +37,24 @@ Forward IV / forward factor:
     the market's own implied vol for the forward stretch between the two
     expirations -- backwardation, and the condition a long calendar wants.
 
-    The variance-additivity equation can solve to a *negative* number under
-    the square root when front-month IV is rich enough relative to the back
-    month -- i.e. no real forward vol satisfies the no-arbitrage relationship.
-    That is the most extreme form of backwardation, but it also means
-    Forward_IV and forward_factor are undefined. Those rows are still
-    included in the output (flagged via `negative_forward_variance`) but are
-    NOT ranked by forward factor -- pandas' NaN sort puts them after every
-    row with a real, computed forward factor, so you can review them by hand
-    rather than trust an invented number.
+    Forward_IV is treated as undefined (forward_factor -> NaN) in two cases,
+    both flagged in the output rather than silently producing a number:
+
+    - `negative_forward_variance`: the equation solves to a *negative* number
+      under the square root (front IV rich enough relative to back IV that no
+      real forward vol satisfies variance additivity). The most extreme form
+      of backwardation there is.
+    - `forward_iv_below_floor`: the equation has a real, positive solution,
+      but it's below MIN_VALID_IV. A Forward_IV that close to zero is
+      dividing forward_factor by almost nothing, so ordinary noise in
+      Yahoo's IV quotes (a point or two either way) swings the ratio by
+      hundreds or thousands of percent -- not a real signal, just the
+      formula amplifying quote noise near its own singularity.
+
+    Rows hitting either case are still included in the output but are NOT
+    ranked by forward factor -- pandas' NaN sort puts them after every row
+    with a real, computed forward factor, so you can review them by hand
+    rather than trust an unstable number.
 
 This is a screening heuristic, not a formal no-arbitrage forward-vol
 calculation -- treat the ranking as a starting point for further diligence,
@@ -162,9 +171,19 @@ def implied_forward_iv(iv_front: float, iv_back: float, T_front: float,
                         T_back: float) -> tuple[float, float]:
     """Solve for the implied vol of the front-to-back forward period.
 
-    Returns (forward_iv, forward_variance). forward_iv is NaN when
-    forward_variance comes out <= 0 -- the equation has no real solution,
-    which signals extreme backwardation rather than a data error.
+    Returns (forward_iv, forward_variance). forward_iv is NaN when:
+      - forward_variance comes out <= 0 (no real solution -- the term
+        structure is inverted enough that the additivity equation breaks), or
+      - forward_variance is positive but tiny, so its square root falls below
+        MIN_VALID_IV. That's not a data error either, but forward_factor
+        divides by this value, and a real-but-near-zero Forward IV is
+        exquisitely sensitive to ordinary noise in Yahoo's IV quotes (a
+        difference of a percentage point or two on either leg swings the
+        forward vol by a large relative amount over a ~30-day forward
+        window). Trusting it as a denominator is how you get forward
+        factors in the thousands of percent from perfectly ordinary-looking
+        front/back IVs -- so it's floored out the same as an out-of-range
+        raw quote would be.
     """
     if not iv_front or not iv_back or T_back <= T_front:
         return np.nan, np.nan
@@ -173,7 +192,19 @@ def implied_forward_iv(iv_front: float, iv_back: float, T_front: float,
     var_forward = (var_back - var_front) / (T_back - T_front)
     if var_forward <= 0:
         return np.nan, var_forward
-    return float(np.sqrt(var_forward)), var_forward
+    fwd_iv = np.sqrt(var_forward)
+    if fwd_iv < MIN_VALID_IV:
+        return np.nan, var_forward
+    return float(fwd_iv), var_forward
+
+
+def classify_forward_iv(fwd_iv: float, var_fwd: float) -> tuple[bool, bool]:
+    """Return (negative_forward_variance, forward_iv_below_floor) flags."""
+    if np.isnan(var_fwd):
+        return False, False
+    negative = var_fwd <= 0
+    below_floor = (not negative) and np.isnan(fwd_iv)
+    return negative, below_floor
 
 
 def forward_factor(iv_front: float, forward_iv: float) -> float:
@@ -337,6 +368,7 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
         if f_leg and b_leg:
             fwd_iv, var_fwd = implied_forward_iv(f_leg.iv, b_leg.iv, T_front, T_back)
             ff = forward_factor(f_leg.iv, fwd_iv)
+            neg_var, below_floor = classify_forward_iv(fwd_iv, var_fwd)
             rows.append({
                 "ticker": ticker, "strategy": "Long Calendar (ATM)",
                 "spot": round(spot, 2),
@@ -346,7 +378,8 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
                 "front_iv": round(f_leg.iv, 4), "back_iv": round(b_leg.iv, 4),
                 "forward_iv": round(fwd_iv, 4) if not np.isnan(fwd_iv) else np.nan,
                 "forward_factor": round(ff, 4) if not np.isnan(ff) else np.nan,
-                "negative_forward_variance": (not np.isnan(var_fwd)) and var_fwd <= 0,
+                "negative_forward_variance": neg_var,
+                "forward_iv_below_floor": below_floor,
                 "front_oi": int(f_leg.open_interest), "back_oi": int(b_leg.open_interest),
                 "total_oi": int(f_leg.open_interest + b_leg.open_interest),
                 "stale_quote": f_leg.stale or b_leg.stale,
@@ -360,13 +393,13 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
         if fc and bc and fp and bp:
             fwd_iv_call, var_fwd_call = implied_forward_iv(fc.iv, bc.iv, T_front, T_back)
             fwd_iv_put, var_fwd_put = implied_forward_iv(fp.iv, bp.iv, T_front, T_back)
-            negative_var = (
-                ((not np.isnan(var_fwd_call)) and var_fwd_call <= 0)
-                or ((not np.isnan(var_fwd_put)) and var_fwd_put <= 0)
-            )
-            if negative_var:
-                # Extreme backwardation on at least one leg -- don't mask it
-                # by averaging in the other leg's (possibly normal) factor.
+            neg_call, floor_call = classify_forward_iv(fwd_iv_call, var_fwd_call)
+            neg_put, floor_put = classify_forward_iv(fwd_iv_put, var_fwd_put)
+            negative_var = neg_call or neg_put
+            below_floor = floor_call or floor_put
+            if negative_var or below_floor:
+                # Unreliable on at least one leg -- don't mask it by
+                # averaging in the other leg's (possibly normal) factor.
                 ff_avg, fwd_iv_avg = np.nan, np.nan
             else:
                 ff_call = forward_factor(fc.iv, fwd_iv_call)
@@ -386,6 +419,7 @@ def screen_ticker(ticker: str, front_target: int, back_target: int,
                 "forward_iv": round(fwd_iv_avg, 4) if not np.isnan(fwd_iv_avg) else np.nan,
                 "forward_factor": round(ff_avg, 4) if not np.isnan(ff_avg) else np.nan,
                 "negative_forward_variance": negative_var,
+                "forward_iv_below_floor": below_floor,
                 "front_oi": int(fc.open_interest + fp.open_interest),
                 "back_oi": int(bc.open_interest + bp.open_interest),
                 "total_oi": int(fc.open_interest + fp.open_interest +
@@ -482,7 +516,7 @@ def main() -> None:
 
     display_cols = [
         "ticker", "strategy", "spot", "forward_factor", "meets_ff_threshold",
-        "negative_forward_variance", "forward_iv",
+        "negative_forward_variance", "forward_iv_below_floor", "forward_iv",
         "front_expiry", "front_dte", "front_strike", "front_iv", "front_oi",
         "back_expiry", "back_dte", "back_strike", "back_iv", "back_oi",
         "total_oi", "stale_quote",
